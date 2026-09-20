@@ -1,0 +1,315 @@
+import cover from "../covers/ef-core-atomic-save.jpg";
+
+export const metadata = {
+  title: "Le contrat qui n'existait qu'à moitié",
+  description:
+    "Deux SaveChanges au lieu d'un, et des contrats sans prêt s'accumulent onze mois sans qu'une alerte se déclenche. Ce qu'EF Core garantit vraiment.",
+  date: "2026-09-10",
+  tags: ["dotnet", "ef-core", "architecture"],
+  cover,
+  coverAlt: "Coupole en verre de la Galleria Vittorio Emanuele II vue depuis l'intérieur.",
+  coverCaption: "Vue depuis le dessous de la coupole en verre de la Galleria Vittorio Emanuele II à Milan.",
+};
+
+*Combien de lignes, dans votre base, violent en ce moment une règle que votre
+code tient pour acquise ? Personne ne le sait. Surtout pas le code, qui dort
+très bien.*
+
+Le rapport d'encours tombe tous les premiers du mois à 6 h 15. Ce matin, il ne
+colle pas avec la compta. L'écart est petit, quelques milliers d'euros sur un
+portefeuille qui en pèse des millions, et il aurait pu passer pour un arrondi.
+Il ne passe pas, parce que le contrôleur de gestion a gardé les rapports
+précédents : l'écart était déjà là le mois dernier, et celui d'avant, et il
+grandit.
+
+Rien n'a planté, rien n'a sonné, et le dernier déploiement remonte à trois
+semaines. La requête est juste, la somme est juste, l'écran est juste. Ce sont
+les données qui mentent, et elles mentent depuis onze mois.
+
+Comment fabrique-t-on onze mois de silence ? Méthodiquement, et avec les
+meilleures intentions du monde.
+
+## L'histoire
+
+<Chapter marker="Sprint 4" title="Il faut bien l'identifiant" />
+
+L'API de gestion de contrats prend forme. Derrière, une base relationnelle
+ordinaire, de l'OLTP de tous les jours : des écritures courtes, nombreuses,
+concurrentes. Le modèle tient en deux classes et une règle que toute l'équipe
+connaît par cœur : un contrat porte au moins un prêt. C'est sur le diagramme,
+en toutes lettres, `1..*`.
+
+L'endpoint de création s'écrit dans la foulée. Il faut créer le contrat, puis
+ses prêts, et les prêts ont besoin de l'identifiant du contrat, que la base
+génère. Donc on sauvegarde une première fois pour l'obtenir :
+
+```csharp
+app.MapPost("/contracts", async (
+    CreateContract request,
+    ContractsContext db,
+    CancellationToken cancellationToken) =>
+{
+    var contract = new Contract { Reference = request.Reference };
+
+    db.Contracts.Add(contract);
+    await db.SaveChangesAsync(cancellationToken);   // contract.Id est enfin là
+
+    foreach (var line in request.Loans)
+    {
+        db.Loans.Add(new Loan
+        {
+            ContractId = contract.Id,               // et on en a besoin ici
+            Amount = line.Amount,
+            StartsOn = line.StartsOn,
+        });
+    }
+
+    await db.SaveChangesAsync(cancellationToken);
+});
+```
+
+Deux approbations en vingt minutes, dont une avec un emoji. Elles ont raison,
+d'ailleurs : la méthode fait proprement ce qu'elle annonce, et le raisonnement
+qui la porte tient en une phrase que tout le monde a prononcée au moins une
+fois. Il me faut la clé avant de créer les enfants, donc je sauvegarde deux
+fois.
+
+Gardez cette phrase sous le coude. C'est la seule chose fausse du chapitre, et
+elle va tenir plus d'un an sans que personne la contredise.
+
+<Chapter marker="Sprint 22" title="Une fois sur trois mille" />
+
+Un mardi de novembre, quelque part entre les deux `SaveChangesAsync`, le
+second n'a pas lieu.
+
+Peu importe la raison qui a servi ce jour-là, elles se valent toutes : un
+timeout sur une base chargée, un deadlock dont on a été choisi comme victime,
+un processus recyclé au milieu de la requête, un onglet fermé dont l'annulation
+descend jusqu'à la base. La liste n'est pas exhaustive, elle est juste déprimante.
+
+Le premier `SaveChangesAsync` avait déjà rendu la main. Le contrat est en base,
+seul, définitivement.
+
+Ce qui compte n'est pas la panne, c'est ce qui ne se passe pas ensuite. Rien ne
+crie. La requête a peut-être renvoyé un 500 noyé parmi ceux de la journée ;
+l'utilisateur, lui, a rafraîchi la page, vu son contrat dans la liste, et
+conclu que c'était passé.
+
+C'est trop rare pour qu'on en tire une leçon, assez fréquent pour que ça
+s'accumule : un contrat par ci, un par là, à un rythme que personne ne mesure.
+Et personne n'a jamais écrit de supervision pour signaler qu'il ne s'était rien
+passé.
+
+<Chapter marker="Onze mois plus tard" title="Une hypothèse raisonnable" />
+
+Nouvel écran, nouveau développeur : le portefeuille. Pour chaque contrat, le
+montant total engagé et la date du premier prêt. Il écrit ce que le modèle lui
+promet.
+
+```csharp
+var contracts = await db.Contracts
+    .Include(c => c.Loans)
+    .ToListAsync(cancellationToken);
+
+var rows = contracts.Select(c => new PortfolioRow(
+    c.Reference,
+    c.Loans.Sum(l => l.Amount),
+    c.Loans.Min(l => l.StartsOn)));
+```
+
+Il ne teste pas le cas du contrat sans prêt. Pourquoi le testerait-il ? Ce cas
+n'existe pas, c'est écrit sur le diagramme depuis le sprint 4. L'écran part en
+production et tourne. Puis, un vendredi, sur trois contrats exactement, il
+tombe :
+
+```text
+System.InvalidOperationException: Sequence contains no elements
+```
+
+`Sum` sur une collection vide renvoie zéro sans broncher, mais `Min` n'a pas de
+valeur à renvoyer, alors elle lève. Le correctif est trouvé en douze minutes
+et il est parfaitement raisonnable : un `Where(c => c.Loans.Count > 0)` en tête
+de requête, et l'écran cesse de tomber. Le ticket se ferme. Tout le monde a
+bien travaillé, d'ailleurs : le correctif est juste, minimal, livré le jour
+même. Il retire simplement de l'écran les trois seuls contrats qui avaient
+quelque chose à signaler.
+
+Il reste le rapport du premier du mois. Les prêts manquants, eux, manquent pour
+de bon : ils n'ont jamais été écrits, et l'écart avec la compta ne se refermera
+pas tout seul.
+
+## Personne n'a fait d'erreur
+
+Trois choses se sont passées, et aucune n'est un bug.
+
+**Ce que `SaveChanges` garantit.** EF Core envoie ses commandes dans une
+transaction quand il en faut une, et ne rend la main qu'une fois l'ensemble
+validé. Si le lot échoue, rien n'est écrit. La garantie est réelle, et elle a
+été tenue à la lettre, les deux fois. Elle porte simplement sur l'appel : deux
+appels, c'est deux transactions, et entre les deux, une fenêtre que rien ne
+couvre. Personne n'a menti. Nous avons demandé deux écritures indépendantes,
+nous les avons obtenues, et c'est ça, le problème.
+
+**Ce que la base garantissait.** La table `Loans` porte une clé étrangère vers
+`Contracts` et une colonne `ContractId` non nulle. Ces deux contraintes disent
+une chose, très fermement : pas de prêt sans contrat. Vous avez bien lu, et
+c'est rigoureusement la garantie inverse de celle dont l'écran portefeuille
+avait besoin.
+
+La clé étrangère protège l'enfant, jamais le parent. Elle veille sur les prêts
+avec un zèle irréprochable et se moque éperdument des contrats. Quant au `1..*`
+du diagramme, il n'est écrit nulle part : aucune contrainte qu'une base
+courante implémente n'exprime "au moins un enfant", et le code ne l'exprime pas
+davantage. Cette cardinalité, sur laquelle tout l'écran repose, ne vit que dans
+la tête de l'équipe.
+
+**Deux écritures, deux faits.** En sauvegardant deux fois, nous avons enseigné
+à la base une proposition à laquelle nous ne croyons pas : un contrat peut
+exister seul. Elle l'a apprise et elle l'applique consciencieusement depuis le
+sprint 4. Le fait métier, "un contrat avec ses prêts", n'est enregistré nulle
+part comme une vérité unique.
+
+Un détail pour finir, à l'intention de ceux qui distribuent le
+`CancellationToken` partout par acquit de conscience : sur ces deux
+`SaveChangesAsync`, le bon réflexe se retourne contre vous. [Un article
+précédent](/blog/aspnet-core-cancellation-token) le disait, annulez librement
+les lectures, décidez en écriture. La règle, la voici en situation.
+
+## Une seule écriture
+
+Le correctif est plus court que le défaut.
+
+```csharp
+var contract = new Contract
+{
+    Reference = request.Reference,
+    Loans = [.. request.Loans.Select(line => new Loan
+    {
+        Amount = line.Amount,
+        StartsOn = line.StartsOn,
+    })],
+};
+
+db.Contracts.Add(contract);
+await db.SaveChangesAsync(cancellationToken);
+```
+
+Un `Add`, un `SaveChangesAsync`, et le fait métier redevient indivisible : soit
+le contrat et ses prêts sont en base, soit rien ne l'est. Le token cesse au
+passage d'être un piège : il n'existe plus d'entre-deux à interrompre.
+
+Reste la phrase du sprint 4 : il me faut la clé avant de créer les enfants.
+Elle était fausse. `Add` ne marque pas une entité,
+il parcourt le graphe des entités accessibles depuis elle et les marque toutes.
+À l'écriture, EF Core ordonne les commandes selon leurs dépendances, insère le
+contrat, récupère la clé que la base vient de générer, et la reporte lui-même
+dans le `ContractId` de chaque prêt. Il faisait déjà tout ça, seul, depuis le
+début. Nous lui avions retiré le travail pour le faire moins bien.
+
+Il reste de vrais cas où une seule écriture ne suffit pas : une commande SQL
+brute par `ExecuteSqlAsync` à côté du `SaveChanges`, ou une écriture
+intermédiaire dont il faut lire le résultat avant de continuer. La transaction
+explicite est alors le bon outil, et les `SaveChanges` qu'elle englobe cessent
+d'ouvrir la leur.
+
+```csharp
+await using var transaction =
+    await db.Database.BeginTransactionAsync(cancellationToken);
+
+// les écritures, dans l'ordre que vous voulez
+
+await transaction.CommitAsync(cancellationToken);
+```
+
+Tout réussit, ou rien ne reste. C'est ce que le `SaveChanges` unique fait
+gratuitement, et c'est pour ça qu'il faut lui laisser sa chance en premier.
+
+## Empêcher, voir, compter
+
+Le code de création est réparé. Restent deux populations : les écritures en
+deux temps que quelqu'un écrira le mois prochain, en toute bonne foi, et les
+contrats vides qui dorment déjà dans votre base. Trois garde-fous, donc : un
+qui empêche, un qui se voit, un qui compte les dégâts.
+
+- **L'agrégat.** Que le contrat fabrique ses prêts. Une fabrique
+  `Contract.Open(reference, lines)` qui refuse une liste vide, un constructeur
+  privé, la collection exposée en lecture seule. L'invariant cesse d'être un
+  dessin : il devient une ligne qu'on ne peut pas contourner, et un test qui
+  porte son nom, `Opening_a_contract_without_a_loan_is_refused`.
+- **Une action métier, une écriture.** Un cas d'usage, un `SaveChanges`. Bonne
+  nouvelle, celui-là se voit : deux `SaveChangesAsync` dans le même handler
+  sautent aux yeux en code review, contrairement à un [lazy
+  loading](/blog/ef-core-lazy-loading) déguisé en accès de propriété. Ils
+  sautaient aux yeux au sprint 4 aussi ; personne ne savait qu'il y avait une
+  question à poser.
+- **Le compte des orphelins.** Parce que vous en avez déjà. La requête tient en
+  trois lignes, elle ne modifie rien, et vous pouvez la lancer maintenant :
+
+  ```sql
+  SELECT COUNT(*)
+  FROM Contracts c
+  WHERE NOT EXISTS (SELECT 1 FROM Loans l WHERE l.ContractId = c.Id);
+  ```
+
+  Si elle renvoie zéro, tant mieux. Sinon, vous venez de mettre un nombre sur
+  onze mois de silence : réparer, archiver ou laisser en l'état devient une
+  décision. Puis planifiez-la, parce qu'un invariant qu'on ne mesure jamais
+  n'est pas un invariant, c'est un espoir.
+
+## Ce qu'il faut retenir
+
+<Takeaways>
+
+<Takeaway title="SaveChanges est atomique, votre écriture ne l'est pas">
+
+La garantie porte sur l'appel, jamais sur l'action métier. Deux appels, deux
+transactions, et une fenêtre entre les deux.
+
+</Takeaway>
+
+<Takeaway title="La clé étrangère protège l'enfant, jamais le parent">
+
+Elle interdit le prêt sans contrat. Le `1..*` du diagramme, lui, n'est écrit
+dans aucune contrainte.
+
+</Takeaway>
+
+<Takeaway title="Vous n'avez jamais eu besoin de l'identifiant">
+
+`Add` marque tout le graphe, EF ordonne les inserts et reporte la clé générée.
+Construisez l'objet entier, sauvegardez une fois.
+
+</Takeaway>
+
+<Takeaway title="L'exception était la bonne nouvelle">
+
+Elle nommait la corruption. Avant de la faire taire, comptez vos orphelins :
+c'est une requête et cinq minutes.
+
+</Takeaway>
+
+</Takeaways>
+
+<Epilogue title="Épilogue">
+
+Soyons justes avec le développeur du sprint 4 : sauvegarder deux fois n'est pas
+une faute en soi. Ça le devient quand l'état intermédiaire n'a pas de nom.
+
+Il existe de vrais domaines où le contrat précède ses prêts : un devis qu'on
+construit sur plusieurs écrans, un dossier qu'on reprend le lendemain. Là, le
+contrat sans prêt n'est pas une anomalie, c'est une étape. Alors il faut le
+dire, et l'écrire : un `Status`,
+`Draft` puis `Active`, une transition qui exige au moins un prêt, des rapports
+qui ne lisent que l'`Active`. L'état incomplet devient légal, visible et nommé,
+au lieu d'illégal, invisible et nié.
+
+La vraie question est là, et elle n'a rien à voir avec EF Core : votre modèle
+a-t-il un mot pour ce qui se passe entre vos deux écritures ? S'il en a un,
+deux `SaveChanges` se défendent très bien. S'il n'en a pas, vous avez déjà en
+base des lignes que votre code croit impossibles, et l'écran qui les
+rencontrera n'est probablement pas encore écrit.
+
+Un `1..*` sur un diagramme est une promesse. Une transaction est le seul
+endroit où une promesse devient un fait.
+
+</Epilogue>
