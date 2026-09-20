@@ -6,4 +6,6 @@ export const routing = defineRouting({
   defaultLocale: "en",
   // Both prefixed, so `/` negotiates rather than silently serving English.
   localePrefix: "always",
+  // The pages render hreflang themselves; the header disagreed with them on fallbacks and x-default.
+  alternateLinks: false,
 });

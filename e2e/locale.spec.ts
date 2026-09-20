@@ -102,6 +102,13 @@ test("an untranslated post claims no alternate it cannot back", async ({
   ).toHaveAttribute("href", /\/fr\/blog\/ef-core-lazy-loading$/);
 });
 
+test("the header carries no hreflang of its own", async ({ request }) => {
+  const response = await request.get("/fr/blog/ef-core-lazy-loading");
+
+  // Next preloads fonts through the same header, so it is not simply absent.
+  expect(response.headers().link ?? "").not.toContain("hreflang");
+});
+
 test("the listing marks a post it only falls back to", async ({ page }) => {
   await page.goto("/en/blog");
 
